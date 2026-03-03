@@ -97,7 +97,7 @@ You could find more information about the image [here](https://hub.docker.com/re
 
 ```
 docker pull john119/vlm
-docker run --gpus all -it -v /host/path:/docker/path --name vlm --ipc=host john119/vlm /bin/bash
+docker run --gpus all -it -v /home/tientoan/Qwen-VL-Series-Finetune:/workspace --name vlm --ipc=host john119/vlm /bin/bash
 ```
 
 ## Installation
