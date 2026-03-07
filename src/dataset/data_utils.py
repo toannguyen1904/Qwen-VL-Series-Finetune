@@ -3,7 +3,7 @@ import torch
 
 from qwen_vl_utils import process_vision_info
 
-from src.constants import (
+from constants import (
     DEFAULT_IMAGE_TOKEN,
     DEFAULT_VIDEO_TOKEN,
     LLAVA_IMAGE_TOKEN,
@@ -67,6 +67,13 @@ def pad_sequence(sequences, padding_side='right', padding_value=0):
         else:
             output.data[i, -length:] = seq
     return output
+
+
+def get_mm_token_type_ids(inputs, input_ids):
+    mm_token_type_ids = inputs.get("mm_token_type_ids")
+    if mm_token_type_ids is None:
+        return torch.zeros_like(input_ids, dtype=torch.long)
+    return mm_token_type_ids.to(dtype=torch.long)
 
 def get_image_info(image_path, min_pixel, max_pixel, width, height, image_patch_size):
     # Using this because of process_vision_info function
