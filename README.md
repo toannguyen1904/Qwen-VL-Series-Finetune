@@ -228,6 +228,31 @@ The script requires a dataset formatted according to the LLaVA specification. Th
 </details>
 
 <details>
+<summary>Example for multi video dataset</summary>
+
+```json
+[
+  {
+    "id": "sample",
+    "image": ["sample1.mp4", "sample2.mp4"],
+    "conversations": [
+      {
+        "from": "human",
+        "value": "<video>\n<video>\nDo two videos feature the same character?"
+      },
+      {
+        "from": "gpt",
+        "value": "Yes, they do."
+      }
+    ]
+  }
+  ...
+]
+```
+
+</details>
+
+<details>
 <summary>Example for DPO dataet</summary>
 
 ```json
