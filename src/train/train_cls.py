@@ -3,11 +3,11 @@ import torch
 from peft import LoraConfig, get_peft_model
 import ast
 from transformers import AutoProcessor, BitsAndBytesConfig, HfArgumentParser, AutoConfig
-from src.trainer import QwenCLSTrainer
-from src.model import Qwen2VLForSequenceClassification, Qwen2_5_VLForSequenceClassification
-from src.dataset import make_classification_data_module
-from src.loss import get_loss_function
-from src.params import DataArguments, ModelArguments, CLSArguments
+from trainer import QwenCLSTrainer
+from model.load_model import load_qwen_vl_sequence_classification_model
+from dataset import make_classification_data_module
+from loss import get_loss_function
+from params import DataArguments, ModelArguments, CLSArguments
 from train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3, safe_save_model_for_hf_trainer
 import pathlib
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
@@ -61,6 +61,10 @@ def configure_vision_tower(model, training_args, compute_dtype, device):
     # Handle merger specifically
     merger_params = model.visual.merger.parameters()
     set_requires_grad(merger_params, not training_args.freeze_merger)
+
+    if hasattr(model.visual, "deepstack_merger_list"):
+        deepstack_merger_list_params = model.visual.deepstack_merger_list.parameters()
+        set_requires_grad(deepstack_merger_list_params, not training_args.freeze_merger)
 
 def configure_llm(model, training_args):
     llm_params = model.language_model.parameters()
@@ -124,32 +128,18 @@ def train():
             )
         ))
 
-    if "Qwen2.5" in model_args.model_id:
-        cfg = AutoConfig.from_pretrained(model_args.model_id)
-        cfg.mlp_head_hidden_dim = training_args.mlp_head_dim
-        cfg.mlp_head_dropout = training_args.mlp_head_dropout
-        cfg.num_labels = training_args.num_labels
-        
-        model = Qwen2_5_VLForSequenceClassification.from_pretrained(
-            model_args.model_id,
-            config=cfg,
-            torch_dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa",
-            **bnb_model_from_pretrained_args
-        )
-    else:
-        cfg = AutoConfig.from_pretrained(model_args.model_id)
-        cfg.mlp_head_hidden_dim = training_args.mlp_head_dim
-        cfg.mlp_head_dropout = training_args.mlp_head_dropout
-        cfg.num_labels = training_args.num_labels
-        
-        model = Qwen2VLForSequenceClassification.from_pretrained(
-            model_args.model_id,
-            config=cfg,
-            torch_dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa",
-            **bnb_model_from_pretrained_args
-        )
+    cfg = AutoConfig.from_pretrained(model_args.model_id)
+    cfg.mlp_head_hidden_dim = training_args.mlp_head_dim
+    cfg.mlp_head_dropout = training_args.mlp_head_dropout
+    cfg.num_labels = training_args.num_labels
+
+    model = load_qwen_vl_sequence_classification_model(
+        model_args.model_id,
+        config=cfg,
+        torch_dtype=compute_dtype,
+        attn_implementation="sdpa" if training_args.disable_flash_attn2 else "flash_attention_2",
+        **bnb_model_from_pretrained_args,
+    )
 
     model.config.use_cache = False
     model.config.num_labels = training_args.num_labels
@@ -167,6 +157,10 @@ def train():
         model.config.torch_dtype = (torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
         from peft import prepare_model_for_kbit_training
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing, gradient_checkpointing_kwargs={"use_reentrant": True})
+        if not training_args.lora_enable:
+            # This wrapper has a trainable classification head even without PEFT adapters.
+            # Mark it so Trainer does not treat it as a purely-quantized frozen base model.
+            model._hf_peft_config_loaded = True
     
     if training_args.gradient_checkpointing:
         model.enable_input_require_grads()
@@ -233,6 +227,12 @@ def train():
     
     samples_per_class = data_module.pop("samples_per_class")
 
+    if training_args.use_liger_kernel:
+        rank0_print("Disabling Liger kernel for sequence classification wrappers.")
+        training_args.use_liger_kernel = False
+        if hasattr(training_args, "liger_kernel_config"):
+            training_args.liger_kernel_config = None
+
     loss_fn = get_loss_function(training_args, samples_per_class=samples_per_class)
     model.loss_fn = loss_fn.to(model.dtype if hasattr(model, "dtype") else torch.float32)
 
@@ -277,6 +277,8 @@ def train():
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_state_dict.bin"))
     else:
+        if training_args.bits in [4, 8] and getattr(model, "_hf_peft_config_loaded", False):
+            model._hf_peft_config_loaded = False
         safe_save_model_for_hf_trainer(trainer, output_dir=training_args.output_dir)
 
 if __name__ == "__main__":

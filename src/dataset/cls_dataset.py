@@ -7,12 +7,18 @@ import ujson as json
 from torch.utils.data import Dataset
 from qwen_vl_utils import process_vision_info
 
-from src.params import DataArguments
-from src.constants import (
+from params import DataArguments
+from constants import (
     SYSTEM_MESSAGE,
 )
 
-from .data_utils import pad_sequence, samples_per_class_from_ids
+from .data_utils import (
+    get_mm_token_type_ids,
+    get_qwen_multimodal_settings,
+    pad_sequence,
+    samples_per_class_from_ids,
+    use_default_system_message,
+)
 
 CLASS_2_ID = {
     "A": 0,
@@ -88,6 +94,7 @@ class ClassificationDataset(Dataset):
         self.video_resized_h = data_args.video_resized_height
         self.fps = data_args.fps
         self.nframes = data_args.nframes
+        self.model_type, _, _ = get_qwen_multimodal_settings(self.model_id)
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -136,7 +143,7 @@ class ClassificationDataset(Dataset):
 
         user_prompt = [{"role": "user", "content": contents}]
 
-        if len(SYSTEM_MESSAGE) > 0:
+        if len(SYSTEM_MESSAGE) > 0 and use_default_system_message(self.model_type):
             system_message = {"role": "system", "content": SYSTEM_MESSAGE}
             user_prompt.insert(0, system_message)
 
@@ -145,6 +152,11 @@ class ClassificationDataset(Dataset):
         )
 
         image_inputs, video_inputs, video_kwargs = process_vision_info(user_prompt, return_video_kwargs=True)
+        video_kwargs = {
+            key: value
+            for key, value in video_kwargs.items()
+            if value is not None and value != []
+        }
 
         data_dict = self.processor(
             text=text,
@@ -153,6 +165,7 @@ class ClassificationDataset(Dataset):
             return_tensors="pt",
             **video_kwargs
         )
+        mm_token_type_ids = get_mm_token_type_ids(data_dict, data_dict["input_ids"])
 
         labels = [torch.tensor(CLASS_2_ID[sources["label"]], dtype=torch.long)]
 
@@ -163,6 +176,7 @@ class ClassificationDataset(Dataset):
 
         data_dict['labels'] = labels
         data_dict['attention_mask'] = attention_mask
+        data_dict['mm_token_type_ids'] = mm_token_type_ids
 
         for key, value in data_dict.items():  # cast data dtype for paligemma
             if torch.is_tensor(value) and torch.is_floating_point(value):
@@ -185,6 +199,7 @@ class DataCollatorForClassificationDataset(object):
         batch_video_thw = []
         batch_image_thw = []
         batch_second_per_grid_ts = []
+        batch_mm_token_type_ids = []
         
         for example in examples:
             keys = example.keys()
@@ -197,6 +212,7 @@ class DataCollatorForClassificationDataset(object):
             
             batch_input_ids.append(example["input_ids"].squeeze(0))
             batch_labels.extend(example["labels"])
+            batch_mm_token_type_ids.append(example["mm_token_type_ids"].squeeze(0))
 
             if "second_per_grid_ts" in keys:
                 batch_second_per_grid_ts.extend(example["second_per_grid_ts"])
@@ -205,6 +221,9 @@ class DataCollatorForClassificationDataset(object):
             batch_input_ids, padding_side=self.padding_side, padding_value=self.pad_token_id
         )
         labels = torch.tensor(batch_labels, dtype=torch.long)
+        mm_token_type_ids = pad_sequence(
+            batch_mm_token_type_ids, padding_side=self.padding_side, padding_value=0
+        )
 
         attention_mask = input_ids != self.pad_token_id
 
@@ -212,6 +231,7 @@ class DataCollatorForClassificationDataset(object):
             'input_ids': input_ids,
             'labels': labels,
             'attention_mask': attention_mask,
+            'mm_token_type_ids': mm_token_type_ids,
         }
 
         if len(batch_pixel_values) > 0:

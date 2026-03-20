@@ -4,26 +4,15 @@ from peft import LoraConfig, get_peft_model
 import ast
 from transformers import (
     AutoProcessor,
-    AutoConfig,
     BitsAndBytesConfig, 
-    Qwen2VLForConditionalGeneration, 
     HfArgumentParser, 
-    Qwen2_5_VLForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
-    Qwen3VLMoeForConditionalGeneration
 )
-from src.trainer import QwenSFTTrainer
-from src.dataset import make_supervised_data_module
-from src.params import DataArguments, ModelArguments, TrainingArguments
+from model.load_model import get_qwen_vl_generation_backbone, load_qwen_vl_generation_model
+from trainer import QwenSFTTrainer
+from dataset import make_supervised_data_module
+from params import DataArguments, ModelArguments, TrainingArguments
 from train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3, safe_save_model_for_hf_trainer
 import pathlib
-from monkey_patch_forward import (
-    replace_qwen3_with_mixed_modality_forward,
-    replace_qwen2_5_with_mixed_modality_forward, 
-    replace_qwen_2_with_mixed_modality_forward,
-    replace_qwen3_vl_moe_with_mixed_modality_forward
-)
-from monkey_patch_vision import replace_qwen2_5_vision
 
 local_rank = None
 
@@ -53,35 +42,39 @@ def set_requires_grad(parameters, requires_grad):
         p.requires_grad = requires_grad
 
 def configure_vision_tower(model, training_args, compute_dtype, device):
-    vision_tower = model.visual
+    backbone = get_qwen_vl_generation_backbone(model)
+    vision_tower = backbone.visual
     vision_tower.to(dtype=compute_dtype, device=device)
 
-    vision_model_params = model.visual.parameters()
+    vision_model_params = backbone.visual.parameters()
     set_requires_grad(vision_model_params, not training_args.freeze_vision_tower)
     
     # Handle merger specifically
-    merger_params = model.visual.merger.parameters()
+    merger_params = backbone.visual.merger.parameters()
     set_requires_grad(merger_params, not training_args.freeze_merger)
 
-    if hasattr(model.visual, "deepstack_merger_list"):
-        deepstack_merger_list_params = model.visual.deepstack_merger_list.parameters()
+    if hasattr(backbone.visual, "deepstack_merger_list"):
+        deepstack_merger_list_params = backbone.visual.deepstack_merger_list.parameters()
         set_requires_grad(deepstack_merger_list_params, not training_args.freeze_merger)
 
 def configure_llm(model, training_args):
+    backbone = get_qwen_vl_generation_backbone(model)
     lm_head = model.lm_head.parameters()
     set_requires_grad(lm_head, not training_args.freeze_llm)
 
-    llm_params = model.language_model.parameters()
+    llm_params = backbone.language_model.parameters()
     set_requires_grad(llm_params, not training_args.freeze_llm)
 
 def unfreeze_topk_layers(model, k_llm: int = 0, k_vis: int = 0):
-    if k_llm and hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
-        for layer in model.language_model.layers[-k_llm:]:
+    backbone = get_qwen_vl_generation_backbone(model)
+
+    if k_llm and hasattr(backbone, "language_model") and hasattr(backbone.language_model, "layers"):
+        for layer in backbone.language_model.layers[-k_llm:]:
             for p in layer.parameters():
                 p.requires_grad = True
 
-    if k_vis and hasattr(model, "visual") and hasattr(model.visual, "blocks"):
-        for blk in model.visual.blocks[-k_vis:]:
+    if k_vis and hasattr(backbone, "visual") and hasattr(backbone.visual, "blocks"):
+        for blk in backbone.visual.blocks[-k_vis:]:
             for p in blk.parameters():
                 p.requires_grad = True
 
@@ -135,44 +128,17 @@ def train():
             )
         ))
 
-    config = AutoConfig.from_pretrained(model_args.model_id)
-
-    if config.model_type == "qwen3_vl_moe":
-        replace_qwen3_vl_moe_with_mixed_modality_forward()
-        model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa",
-            **bnb_model_from_pretrained_args
-        )
-
-    elif config.model_type == "qwen3_vl":
-        replace_qwen3_with_mixed_modality_forward()
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa",
-            **bnb_model_from_pretrained_args
-        )
-
-    elif config.model_type == "qwen2_5_vl":
-        replace_qwen2_5_with_mixed_modality_forward()
-        replace_qwen2_5_vision()
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
-        )
-        
-    else:
-        replace_qwen_2_with_mixed_modality_forward()
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
-        )
+    model = load_qwen_vl_generation_model(
+        model_args.model_id,
+        dtype=compute_dtype,
+        attn_implementation="sdpa" if training_args.disable_flash_attn2 else "flash_attention_2",
+        **bnb_model_from_pretrained_args,
+    )
+    if training_args.use_liger_kernel and model.config.model_type in {"qwen3_5", "qwen3_5_moe"}:
+        rank0_print(f"Disabling Liger kernel for unsupported model_type: {model.config.model_type}")
+        training_args.use_liger_kernel = False
+        if hasattr(training_args, "liger_kernel_config"):
+            training_args.liger_kernel_config = None
 
     model.config.use_cache = False
     model_to_configure = model

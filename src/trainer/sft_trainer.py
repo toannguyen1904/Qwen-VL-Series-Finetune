@@ -22,7 +22,7 @@ from transformers.trainer_utils import EvalLoopOutput
 from torch.utils.data import DataLoader
 from train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3
 
-from src.constants import IGNORE_INDEX
+from constants import IGNORE_INDEX
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -260,6 +260,17 @@ class QwenSFTTrainer(Trainer):
             "input_ids": padded_prompts,
             "attention_mask": attention_masks,
         }
+
+        if "mm_token_type_ids" in original_inputs:
+            padded_mm_token_type_ids = torch.zeros(
+                (batch_size, max_prompt_len),
+                dtype=original_inputs["mm_token_type_ids"].dtype,
+                device=device,
+            )
+            for i, prompt in enumerate(batch_prompt_ids):
+                prompt_len = len(prompt)
+                padded_mm_token_type_ids[i, :prompt_len] = original_inputs["mm_token_type_ids"][i, :prompt_len]
+            gen_inputs["mm_token_type_ids"] = padded_mm_token_type_ids
 
         # Add vision inputs if present
         if "pixel_values" in original_inputs:

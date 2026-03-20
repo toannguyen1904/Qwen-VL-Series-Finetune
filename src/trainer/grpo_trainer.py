@@ -1,9 +1,12 @@
 import os
+import inspect
 import torch
 from pathlib import Path
+from types import MethodType
 import torch.nn as nn
 from typing import Any
 
+import trl.import_utils as trl_import_utils
 from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
@@ -17,6 +20,19 @@ from transformers.trainer import (
 from transformers.pytorch_utils import (
     ALL_LAYERNORM_LAYERS
 )
+
+
+def _normalize_trl_optional_flags():
+    for name in dir(trl_import_utils):
+        if not (name.startswith("_") and name.endswith("_available")):
+            continue
+        value = getattr(trl_import_utils, name)
+        if isinstance(value, tuple):
+            setattr(trl_import_utils, name, value[0])
+
+
+_normalize_trl_optional_flags()
+
 from trl import GRPOTrainer
 from trl.data_utils import is_conversational
 from trl.trainer.utils import (
@@ -29,7 +45,7 @@ from trl.trainer.utils import (
 )
 from trl.extras.profiling import profiling_decorator
 from accelerate.utils import gather_object, is_peft_model
-from src.train.train_utils import get_peft_state_non_lora_maybe_zero_3
+from train.train_utils import get_peft_state_non_lora_maybe_zero_3
 
 
 def _identity_collator(features):
@@ -37,11 +53,67 @@ def _identity_collator(features):
     return features
 
 
+def _iter_generate_models(model):
+    seen = set()
+    stack = [model]
+
+    while stack:
+        candidate = stack.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        yield candidate
+
+        if hasattr(candidate, "module"):
+            stack.append(candidate.module)
+
+        if is_peft_model(candidate):
+            try:
+                stack.append(candidate.get_base_model())
+            except Exception:
+                pass
+
+        base_model = getattr(candidate, "base_model", None)
+        if base_model is not None:
+            stack.append(base_model)
+
+
+def _ensure_mm_token_type_ids_generate_compat(model):
+    for candidate in _iter_generate_models(model):
+        config = getattr(candidate, "config", None)
+        model_type = getattr(config, "model_type", None)
+        if model_type not in {"qwen2_vl", "qwen2_5_vl", "qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"}:
+            continue
+
+        try:
+            forward_sig = inspect.signature(candidate.forward)
+        except (TypeError, ValueError):
+            continue
+
+        if "mm_token_type_ids" in forward_sig.parameters:
+            continue
+
+        # Liger replaces the multimodal forward without exposing `mm_token_type_ids`
+        # in the Python signature. Generation validation then rejects the kwarg
+        # before it reaches the underlying Qwen-VL model.
+        original_forward = candidate.forward
+
+        def forward_with_mm_token_type_ids(self, *args, mm_token_type_ids=None, **kwargs):
+            if mm_token_type_ids is not None:
+                kwargs["mm_token_type_ids"] = mm_token_type_ids
+            return original_forward(*args, **kwargs)
+
+        candidate.forward = MethodType(forward_with_mm_token_type_ids, candidate)
+
+
 class QwenGRPOTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
         super(QwenGRPOTrainer, self).__init__(*args, **kwargs)
         # Override data_collator to prevent any data processing
         self.data_collator = _identity_collator
+        _ensure_mm_token_type_ids_generate_compat(self.model)
+        _ensure_mm_token_type_ids_generate_compat(getattr(self, "model_wrapped", None))
+        _ensure_mm_token_type_ids_generate_compat(getattr(self, "ref_model", None))
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -120,6 +192,7 @@ class QwenGRPOTrainer(GRPOTrainer):
             torch.no_grad(),
             FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
         ):
+            _ensure_mm_token_type_ids_generate_compat(unwrapped_model)
             prompt_completion_ids = unwrapped_model.generate(
                 **generate_inputs, generation_config=self.generation_config, disable_compile=True
             )
@@ -139,7 +212,15 @@ class QwenGRPOTrainer(GRPOTrainer):
         prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool(), strict=True)]
         completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool(), strict=True)]
 
-        return prompt_ids, completion_ids, None, {}
+        extra_fields = {}
+        if "mm_token_type_ids" in generate_inputs:
+            prompt_mm_token_type_ids = generate_inputs["mm_token_type_ids"]
+            prompt_mm_token_type_ids = [
+                mm[m].tolist() for mm, m in zip(prompt_mm_token_type_ids, prompt_mask.bool(), strict=True)
+            ]
+            extra_fields["prompt_mm_token_type_ids"] = prompt_mm_token_type_ids
+
+        return prompt_ids, completion_ids, None, extra_fields
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, torch.Tensor | Any]]
@@ -217,6 +298,14 @@ class QwenGRPOTrainer(GRPOTrainer):
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
         prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
         prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
+        if "prompt_mm_token_type_ids" in extra_fields:
+            prompt_mm_token_type_ids = [
+                torch.tensor(ids, device=device, dtype=torch.long)
+                for ids in extra_fields["prompt_mm_token_type_ids"]
+            ]
+            prompt_mm_token_type_ids = pad(prompt_mm_token_type_ids, padding_value=0, padding_side="left")
+        else:
+            prompt_mm_token_type_ids = None
         completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
         completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
         completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
@@ -299,6 +388,10 @@ class QwenGRPOTrainer(GRPOTrainer):
             token_type_ids = forward_kwargs["token_type_ids"]
             forward_kwargs["token_type_ids"] = torch.cat(
                 [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
+            )
+        if prompt_mm_token_type_ids is not None:
+            forward_kwargs["mm_token_type_ids"] = torch.cat(
+                [prompt_mm_token_type_ids, prompt_mm_token_type_ids.new_zeros(completion_ids.shape)], dim=1
             )
 
         with torch.no_grad():
@@ -498,6 +591,8 @@ class QwenGRPOTrainer(GRPOTrainer):
             output["video_grid_thw"] = forward_kwargs["video_grid_thw"]
         if "second_per_grid_ts" in forward_kwargs:
             output["second_per_grid_ts"] = forward_kwargs["second_per_grid_ts"]
+        if "mm_token_type_ids" in forward_kwargs:
+            output["mm_token_type_ids"] = forward_kwargs["mm_token_type_ids"]
 
         if "token_type_ids" in forward_kwargs:
             output["token_type_ids"] = forward_kwargs["token_type_ids"]
@@ -523,6 +618,7 @@ class QwenGRPOTrainer(GRPOTrainer):
         pixel_values_videos=None,
         video_grid_thw=None,
         second_per_grid_ts=None,
+        mm_token_type_ids=None,
     ) -> dict[str, torch.Tensor | None]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
@@ -553,6 +649,8 @@ class QwenGRPOTrainer(GRPOTrainer):
                 model_inputs["video_grid_thw"] = video_grid_thw[start : start + batch_size]
             if second_per_grid_ts is not None:
                 model_inputs["second_per_grid_ts"] = second_per_grid_ts[start : start + batch_size]
+            if mm_token_type_ids is not None:
+                model_inputs["mm_token_type_ids"] = mm_token_type_ids[start : start + batch_size]
 
             if pixel_attention_mask is not None:
                 model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
@@ -603,6 +701,7 @@ class QwenGRPOTrainer(GRPOTrainer):
         pixel_values_videos=None,
         video_grid_thw=None,
         second_per_grid_ts=None,
+        mm_token_type_ids=None,
     ):
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
@@ -622,6 +721,8 @@ class QwenGRPOTrainer(GRPOTrainer):
             model_inputs["pixel_values_videos"] = pixel_values_videos
         if second_per_grid_ts is not None:
             model_inputs["second_per_grid_ts"] = second_per_grid_ts
+        if mm_token_type_ids is not None:
+            model_inputs["mm_token_type_ids"] = mm_token_type_ids
 
         # For SmolVLM2
         if pixel_attention_mask is not None:
@@ -665,6 +766,7 @@ class QwenGRPOTrainer(GRPOTrainer):
             inputs.get("pixel_values_videos"),
             inputs.get("video_grid_thw"),
             inputs.get("second_per_grid_ts"),
+            inputs.get("mm_token_type_ids"),
         )
 
         # compute loss and metrics using liger grpo loss
@@ -714,6 +816,7 @@ class QwenGRPOTrainer(GRPOTrainer):
             pixel_values_videos=inputs.get("pixel_values_videos"),
             video_grid_thw=inputs.get("video_grid_thw"),
             second_per_grid_ts=inputs.get("second_per_grid_ts"),
+            mm_token_type_ids=inputs.get("mm_token_type_ids"),
         )
 
         if self.top_entropy_quantile < 1.0:
