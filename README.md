@@ -252,7 +252,7 @@ The script requires a dataset formatted according to the LLaVA specification. Th
 [
   {
     "id": "sample",
-    "image": ["sample1.mp4", "sample2.mp4"],
+    "video": ["sample1.mp4", "sample2.mp4"],
     "conversations": [
       {
         "from": "human",
