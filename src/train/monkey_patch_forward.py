@@ -47,6 +47,25 @@ def _make_dummy_qwen3_visual_inputs(visual):
     return dummy_pixel, dummy_grid
 
 
+def _expand_video_grid_to_frames(video_grid_thw):
+    """Expand per-video grid (T, H, W) to per-frame grid (1, H, W) repeated T times.
+
+    The Qwen3-VL processor inserts per-frame timestamp separators (mm_token_type_ids=0)
+    between temporal frames, so get_rope_index sees T separate type-2 groups per video.
+    It expects one grid entry per group, but the visual encoder needs the original
+    per-video grid. This helper creates the per-frame variant for position computation.
+    """
+    if video_grid_thw is None:
+        return None
+    frames = []
+    for grid in video_grid_thw:
+        t = grid[0].item()
+        frame_grid = grid.unsqueeze(0).expand(t, -1).clone()
+        frame_grid[:, 0] = 1
+        frames.append(frame_grid)
+    return torch.cat(frames, dim=0)
+
+
 def replace_qwen_2_with_mixed_modality_forward():
     transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLModel.forward = qwen2_mixed_modality_forward
 
@@ -290,7 +309,7 @@ def qwen3_vl_moe_mixed_modality_forward(
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
+            video_grid_thw=_expand_video_grid_to_frames(video_grid_thw),
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -408,7 +427,7 @@ def qwen3_vl_mixed_modality_forward(
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
+            video_grid_thw=_expand_video_grid_to_frames(video_grid_thw),
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
